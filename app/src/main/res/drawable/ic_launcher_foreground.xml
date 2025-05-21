@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- 水滴外形 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,24C54,24 34,48 34,65C34,82 42.5,91 54,91C65.5,91 74,82 74,65C74,48 54,24 54,24Z" />
+    
+    <!-- O字 -->
+    <path
+        android:fillColor="#000000"
+        android:pathData="M48,65C48,68.3 50.7,71 54,71C57.3,71 60,68.3 60,65C60,61.7 57.3,59 54,59C50.7,59 48,61.7 48,65Z" />
+    
+    <!-- 2数字 -->
+    <path
+        android:fillColor="#000000"
+        android:pathData="M62,57L66,57C67.1,57 68,57.9 68,59L68,62.5C68,63.05 67.8,63.59 67.41,64.01C67.03,64.44 66.5,64.71 65.9,64.75L64,65L64,67L68,67L68,69L62,69L62,63L66,63L66,59L62,59L62,57Z" />
+</vector>
