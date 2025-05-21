@@ -1,6 +1,11 @@
 package com.example.blueteeth;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.Service;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
@@ -8,6 +13,7 @@ import android.bluetooth.BluetoothSocket;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Binder;
+import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Message;
@@ -15,11 +21,16 @@ import android.util.Log;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.ActivityCompat;
+import androidx.core.app.NotificationCompat;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.reflect.Method;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.Locale;
 import java.util.UUID;
 
 public class BluetoothService extends Service {
@@ -34,6 +45,10 @@ public class BluetoothService extends Service {
     // 消息类型
     private static final int MESSAGE_READ = 1;
     private static final int MESSAGE_STATUS = 2;
+
+    // 前台服务相关常量
+    private static final int NOTIFICATION_ID = 1001;
+    private static final String CHANNEL_ID = "BluetoothServiceChannel";
 
     // 重连相关常量
     private static final int MAX_RECONNECT_ATTEMPTS = 3; // 最大重连次数
@@ -52,16 +67,91 @@ public class BluetoothService extends Service {
     private ConnectedThread connectedThread;
     private Handler handler;
     private int state;
+    
+    // 数据管理相关
+    private boolean isMeasuring = false;
+    private ArrayList<DataPoint> dataPoints = new ArrayList<>();
+    private static final int MAX_DATA_POINTS = 1000; // 最大数据点数量限制
+    private DataDBHelper dbHelper; // 数据库帮助类
 
     @Override
     public void onCreate() {
         super.onCreate();
         bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
         state = STATE_DISCONNECTED;
+        dbHelper = DataDBHelper.getInstance(this);
+        
+        // 创建通知通道（仅在Android 8.0及以上需要）
+        createNotificationChannel();
+        
+        // 启动前台服务
+        startForeground(NOTIFICATION_ID, createNotification("蓝牙服务正在运行", "未连接设备"));
+    }
+
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID,
+                    "蓝牙服务",
+                    NotificationManager.IMPORTANCE_LOW);
+            
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            manager.createNotificationChannel(channel);
+        }
+    }
+
+    private Notification createNotification(String title, String text) {
+        // 创建点击通知后的意图（打开主活动）
+        Intent notificationIntent = new Intent(this, MainActivity.class);
+        PendingIntent pendingIntent = PendingIntent.getActivity(
+                this, 0, notificationIntent, PendingIntent.FLAG_IMMUTABLE);
+
+        // 构建通知
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setSmallIcon(R.drawable.ic_bluetooth)
+                .setContentIntent(pendingIntent);
+
+        return builder.build();
+    }
+
+    @SuppressLint("NotificationPermission")
+    private void updateNotification(String text) {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        manager.notify(NOTIFICATION_ID, createNotification("蓝牙服务正在运行", text));
     }
 
     public void setHandler(Handler handler) {
         this.handler = handler;
+    }
+
+    // 管理测量状态的方法
+    public void startMeasuring() {
+        if (state != STATE_CONNECTED) {
+            return;
+        }
+        isMeasuring = true;
+        updateNotification("正在测量数据...");
+    }
+
+    public void stopMeasuring() {
+        isMeasuring = false;
+        updateNotification(state == STATE_CONNECTED ? "已连接设备" : "未连接设备");
+    }
+
+    public boolean isMeasuring() {
+        return isMeasuring;
+    }
+
+    // 获取数据的方法
+    public ArrayList<DataPoint> getDataPoints() {
+        return new ArrayList<>(dataPoints); // 返回副本以避免并发修改
+    }
+
+    // 清除数据的方法
+    public void clearDataPoints() {
+        dataPoints.clear();
     }
 
     public void connect(String address) {
@@ -71,6 +161,9 @@ public class BluetoothService extends Service {
 
         // 添加日志，便于调试
         Log.d(TAG, "尝试连接到设备: " + address);
+        
+        // 更新通知
+        updateNotification("正在连接到设备...");
 
         // 如果正在连接，先停止连接线程
         if (state == STATE_CONNECTING) {
@@ -138,6 +231,23 @@ public class BluetoothService extends Service {
 
         // 记录状态变化
         Log.d(TAG, "蓝牙状态变化: " + stateToString(oldState) + " -> " + stateToString(newState));
+        
+        // 更新通知
+        switch (newState) {
+            case STATE_CONNECTED:
+                updateNotification("已连接设备");
+                break;
+            case STATE_CONNECTING:
+                updateNotification("正在连接设备...");
+                break;
+            case STATE_DISCONNECTED:
+                updateNotification("未连接设备");
+                stopMeasuring(); // 断开连接时停止测量
+                break;
+            case STATE_CONNECTION_FAILED:
+                updateNotification("连接失败");
+                break;
+        }
 
         if (handler != null) {
             Message msg = handler.obtainMessage(MESSAGE_STATUS, newState, -1);
@@ -386,16 +496,110 @@ public class BluetoothService extends Service {
                 // 从缓冲区删除该行（包括换行符）
                 dataBuffer.delete(0, newlineIndex + 2); // 2 是 \r\n 的长度
 
-                // 如果是有效行，发送到主线程
-                if (line.length() > 0 && handler != null) {
-                    // 创建新的缓冲区来存储这行数据
-                    byte[] lineBytes = line.getBytes();
-
+                // 如果是有效行且正在测量，处理数据
+                if (line.length() > 0) {
                     // 发送到主线程
-                    Message msg = handler.obtainMessage(MESSAGE_READ, lineBytes.length, -1);
-                    msg.obj = lineBytes;
-                    msg.sendToTarget();
+                    if (handler != null) {
+                        // 创建新的缓冲区来存储这行数据
+                        byte[] lineBytes = line.getBytes();
+
+                        // 发送到主线程
+                        Message msg = handler.obtainMessage(MESSAGE_READ, lineBytes.length, -1);
+                        msg.obj = lineBytes;
+                        msg.sendToTarget();
+                    }
+                    
+                    // 如果正在测量，处理数据并存储
+                    if (isMeasuring) {
+                        processReceivedData(line.trim());
+                    }
                 }
+            }
+        }
+        
+        // 处理接收到的数据
+        private void processReceivedData(String data) {
+            // 获取当前时间戳
+            String timestamp = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
+
+            // 检查数据格式
+            if (data.startsWith("Data1:")) {
+                // 处理原始ADC值
+                try {
+                    String valueStr = data.substring(data.indexOf(":") + 1).trim();
+                    float value = Float.parseFloat(valueStr);
+
+                    // 创建数据点
+                    DataPoint dataPoint = new DataPoint(timestamp, value, DataPoint.TYPE_RAW);
+
+                    // 添加到数据列表
+                    addDataPoint(dataPoint);
+
+                } catch (NumberFormatException e) {
+                    Log.e(TAG, "数据格式错误: " + data, e);
+                }
+            } else if (data.startsWith("Data2:")) {
+                // 处理氧浓度数据
+                try {
+                    // 提取数值，去掉末尾的%符号
+                    String valueStr = data.substring(data.indexOf(":") + 1, data.indexOf("%")).trim();
+                    float value = Float.parseFloat(valueStr);
+
+                    // 创建数据点
+                    DataPoint dataPoint = new DataPoint(timestamp, value, DataPoint.TYPE_PERCENTAGE);
+
+                    // 添加到数据列表
+                    addDataPoint(dataPoint);
+
+                } catch (NumberFormatException | StringIndexOutOfBoundsException e) {
+                    Log.e(TAG, "数据格式错误: " + data, e);
+                }
+            } else if (data.startsWith("Data3:")) {
+                // 处理电压数据
+                try {
+                    // 提取数值，去掉末尾的V符号
+                    String valueStr = data.substring(data.indexOf(":") + 1, data.indexOf("V")).trim();
+                    float value = Float.parseFloat(valueStr);
+
+                    // 创建数据点
+                    DataPoint dataPoint = new DataPoint(timestamp, value, DataPoint.TYPE_VOLTAGE);
+
+                    // 添加到数据列表
+                    addDataPoint(dataPoint);
+
+                } catch (NumberFormatException | StringIndexOutOfBoundsException e) {
+                    Log.e(TAG, "数据格式错误: " + data, e);
+                }
+            }
+        }
+        
+        // 添加数据点到数据列表和数据库
+        private void addDataPoint(DataPoint dataPoint) {
+            // 加入到数据列表
+            synchronized (dataPoints) {
+                dataPoints.add(dataPoint);
+                
+                // 如果数据点超过最大限制，删除最早的数据点
+                if (dataPoints.size() > MAX_DATA_POINTS) {
+                    dataPoints.remove(0);
+                }
+            }
+            
+            // 保存到数据库
+            saveDataPointToDB(dataPoint);
+        }
+        
+        // 保存数据点到数据库
+        private void saveDataPointToDB(DataPoint dataPoint) {
+            boolean success = dbHelper.addDataPoint(dataPoint);
+            if (!success) {
+                Log.e(TAG, "保存数据点失败");
+            }
+
+            // 清理旧数据（超过一周的）
+            int deleted = dbHelper.deleteOldData();
+            if (deleted > 0) {
+                Log.d(TAG, "已删除 " + deleted + " 条旧数据");
             }
         }
 
@@ -428,7 +632,7 @@ public class BluetoothService extends Service {
 
     @Override
     public boolean onUnbind(Intent intent) {
-        disconnect();
+        // 不断开连接，让前台服务继续运行
         return super.onUnbind(intent);
     }
 
@@ -436,6 +640,7 @@ public class BluetoothService extends Service {
     public void onDestroy() {
         super.onDestroy();
         disconnect();
+        stopForeground(true);
     }
 
     public class LocalBinder extends Binder {

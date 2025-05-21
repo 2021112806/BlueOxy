@@ -35,6 +35,7 @@ import android.content.BroadcastReceiver;
 
 public class DataDisplayActivity extends AppCompatActivity {
 
+    private static final String TAG = "DataDisplayActivity";
     private static final int MESSAGE_READ = 1;
     private static final int MESSAGE_STATUS = 2;
     private static final int MAX_DISPLAYED_DATA = 100; // 最大显示数据条数
@@ -52,29 +53,17 @@ public class DataDisplayActivity extends AppCompatActivity {
     private String deviceName;
     private String deviceAddress;
 
-    private boolean isMeasuring = false;
-    private ArrayList<DataPoint> dataPoints = new ArrayList<>();
     private float lastOxygenLevel = 0.0f; // 最后一次记录的氧气浓度
 
     private BluetoothService bluetoothService;
     private boolean isServiceBound = false;
+    
+    // 定时刷新UI的Handler
+    private final Handler uiUpdateHandler = new Handler(Looper.getMainLooper());
+    private Runnable uiUpdateRunnable;
+    private static final int UI_UPDATE_INTERVAL = 500; // 500毫秒更新一次UI
 
-    // 添加刷新数据的广播接收器
-    private final BroadcastReceiver dataRequestReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            if ("com.example.blueteeth.REQUEST_DATA".equals(intent.getAction())) {
-                Log.d("DataDisplayActivity", "收到图表刷新请求");
-
-                // 直接将当前数据发送回去，而不是向蓝牙设备请求
-                Intent dataIntent = new Intent("com.example.blueteeth.DATA_UPDATED");
-                dataIntent.putParcelableArrayListExtra("data_points", dataPoints);
-                context.sendBroadcast(dataIntent);
-
-                Log.d("DataDisplayActivity", "已将当前数据发送给图表页面");
-            }
-        }
-    };
+    // 不再需要数据请求的广播接收器，数据由服务直接管理
 
     private final ServiceConnection serviceConnection = new ServiceConnection() {
         @Override
@@ -93,12 +82,18 @@ public class DataDisplayActivity extends AppCompatActivity {
                 // 尝试连接
                 bluetoothService.connect(deviceAddress);
             }
+            
+            // 开始定时刷新UI
+            startUiUpdateTimer();
         }
 
         @Override
         public void onServiceDisconnected(ComponentName name) {
             bluetoothService = null;
             isServiceBound = false;
+            
+            // 停止UI更新
+            stopUiUpdateTimer();
         }
     };
 
@@ -108,16 +103,7 @@ public class DataDisplayActivity extends AppCompatActivity {
         public void handleMessage(@NonNull Message msg) {
             switch (msg.what) {
                 case MESSAGE_READ:
-                    if (isMeasuring) {
-                        byte[] readBuffer = (byte[]) msg.obj;
-                        int readBufferPosition = msg.arg1;
-
-                        // 将接收到的字节转换为字符串
-                        String receivedData = new String(readBuffer, 0, readBufferPosition);
-
-                        // STM32发送的格式是完整的一行，不需要额外处理
-                        processReceivedData(receivedData.trim());
-                    }
+                    // 不需要在这里处理数据，数据会由服务保存，我们只需定期刷新UI即可
                     break;
 
                 case MESSAGE_STATUS:
@@ -128,42 +114,38 @@ public class DataDisplayActivity extends AppCompatActivity {
                         case BluetoothService.STATE_CONNECTED:
                             statusText = "已连接";
                             connectionStatusTextView.setText(R.string.connected);
-                            Log.i("DataDisplay", "蓝牙已连接");
+                            Log.i(TAG, "蓝牙已连接");
                             break;
 
                         case BluetoothService.STATE_CONNECTING:
                             statusText = "连接中";
                             connectionStatusTextView.setText(R.string.connecting);
-                            Log.i("DataDisplay", "蓝牙连接中");
+                            Log.i(TAG, "蓝牙连接中");
                             break;
 
                         case BluetoothService.STATE_DISCONNECTED:
                             statusText = "已断开";
                             connectionStatusTextView.setText(R.string.disconnected);
-                            Log.i("DataDisplay", "蓝牙已断开");
-                            // 如果断开连接且正在测量，则停止测量
-                            if (isMeasuring) {
-                                isMeasuring = false;
-                                startMeasureButton.setText(R.string.start_measure);
-                                Toast.makeText(DataDisplayActivity.this, "蓝牙连接已断开，测量已停止", Toast.LENGTH_SHORT).show();
-                            }
+                            Log.i(TAG, "蓝牙已断开");
+                            
+                            // 如果蓝牙断开，更新UI显示
+                            startMeasureButton.setText(R.string.start_measure);
+                            Toast.makeText(DataDisplayActivity.this, "蓝牙连接已断开，测量已停止", Toast.LENGTH_SHORT).show();
                             break;
 
                         case BluetoothService.STATE_CONNECTION_FAILED:
                             statusText = "连接失败";
                             connectionStatusTextView.setText(R.string.connection_failed);
-                            Log.i("DataDisplay", "蓝牙连接失败");
-                            // 如果连接失败且正在测量，则停止测量
-                            if (isMeasuring) {
-                                isMeasuring = false;
-                                startMeasureButton.setText(R.string.start_measure);
-                            }
+                            Log.i(TAG, "蓝牙连接失败");
+                            
+                            // 连接失败也更新UI
+                            startMeasureButton.setText(R.string.start_measure);
                             Toast.makeText(DataDisplayActivity.this, R.string.connection_failed, Toast.LENGTH_SHORT)
                                     .show();
                             break;
                     }
 
-                    Log.d("DataDisplay", "蓝牙状态更新: " + statusText);
+                    Log.d(TAG, "蓝牙状态更新: " + statusText);
                     break;
             }
         }
@@ -196,10 +178,6 @@ public class DataDisplayActivity extends AppCompatActivity {
         // 绑定蓝牙服务
         Intent serviceIntent = new Intent(this, BluetoothService.class);
         bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE);
-
-        // 注册广播接收器
-        IntentFilter filter = new IntentFilter("com.example.blueteeth.REQUEST_DATA");
-        registerReceiver(dataRequestReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
 
         // 设置点击监听
         setClickListeners();
@@ -234,13 +212,13 @@ public class DataDisplayActivity extends AppCompatActivity {
                 return;
             }
 
-            if (isMeasuring) {
+            if (bluetoothService.isMeasuring()) {
                 // 停止测量
-                isMeasuring = false;
+                bluetoothService.stopMeasuring();
                 startMeasureButton.setText(R.string.start_measure);
             } else {
                 // 开始测量
-                isMeasuring = true;
+                bluetoothService.startMeasuring();
                 startMeasureButton.setText(R.string.stop_measure);
             }
         });
@@ -253,107 +231,61 @@ public class DataDisplayActivity extends AppCompatActivity {
 
         // 查看图表按钮
         viewChartButton.setOnClickListener(v -> {
-            Intent intent = new Intent(DataDisplayActivity.this, ChartActivity.class);
-            // 传递当前数据点列表
-            intent.putParcelableArrayListExtra("data_points", dataPoints);
-            startActivity(intent);
+            if (isServiceBound && bluetoothService != null) {
+                Intent intent = new Intent(DataDisplayActivity.this, ChartActivity.class);
+                // 不需要传递数据，ChartActivity将直接从服务获取
+                startActivity(intent);
+            } else {
+                Toast.makeText(this, "蓝牙服务未就绪，请稍后再试", Toast.LENGTH_SHORT).show();
+            }
         });
     }
-
-    // 处理接收到的数据
-    private void processReceivedData(String data) {
-        // 获取当前时间戳
-        String timestamp = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
-
-        // 检查数据格式
-        if (data.startsWith("Data1:")) {
-            // 处理原始ADC值
-            try {
-                String valueStr = data.substring(data.indexOf(":") + 1).trim();
-                float value = Float.parseFloat(valueStr);
-
-                // 创建数据点
-                DataPoint dataPoint = new DataPoint(timestamp, value, DataPoint.TYPE_RAW);
-
-                // 添加到数据列表
-                dataPoints.add(dataPoint);
-
-                // 保存到数据库
-                saveDataPointToDB(dataPoint);
-
-                // 更新显示
-                updateDataDisplay();
-            } catch (NumberFormatException e) {
-                Toast.makeText(this, "数据格式错误: " + data, Toast.LENGTH_SHORT).show();
+    
+    // 开始定时刷新UI
+    private void startUiUpdateTimer() {
+        uiUpdateRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (isServiceBound && bluetoothService != null) {
+                    // 从服务获取最新数据并更新UI
+                    updateDataDisplay();
+                }
+                
+                // 继续定时执行
+                uiUpdateHandler.postDelayed(this, UI_UPDATE_INTERVAL);
             }
-        } else if (data.startsWith("Data2:")) {
-            // 处理氧浓度数据
-            try {
-                // 提取数值，去掉末尾的%符号
-                String valueStr = data.substring(data.indexOf(":") + 1, data.indexOf("%")).trim();
-                float value = Float.parseFloat(valueStr);
-
-                // 保存最新的氧气浓度值
-                lastOxygenLevel = value;
-
-                // 更新氧气浓度显示和指示灯
-                updateOxygenDisplay(value);
-
-                // 创建数据点
-                DataPoint dataPoint = new DataPoint(timestamp, value, DataPoint.TYPE_PERCENTAGE);
-
-                // 添加到数据列表
-                dataPoints.add(dataPoint);
-
-                // 保存到数据库
-                saveDataPointToDB(dataPoint);
-
-                // 更新显示
-                updateDataDisplay();
-            } catch (NumberFormatException | StringIndexOutOfBoundsException e) {
-                Toast.makeText(this, "数据格式错误: " + data, Toast.LENGTH_SHORT).show();
-            }
-        } else if (data.startsWith("Data3:")) {
-            // 处理电压数据
-            try {
-                // 提取数值，去掉末尾的V符号
-                String valueStr = data.substring(data.indexOf(":") + 1, data.indexOf("V")).trim();
-                float value = Float.parseFloat(valueStr);
-
-                // 创建数据点
-                DataPoint dataPoint = new DataPoint(timestamp, value, DataPoint.TYPE_VOLTAGE);
-
-                // 添加到数据列表
-                dataPoints.add(dataPoint);
-
-                // 保存到数据库
-                saveDataPointToDB(dataPoint);
-
-                // 更新显示
-                updateDataDisplay();
-            } catch (NumberFormatException | StringIndexOutOfBoundsException e) {
-                Toast.makeText(this, "数据格式错误: " + data, Toast.LENGTH_SHORT).show();
-            }
-        }
+        };
+        
+        // 立即开始第一次更新
+        uiUpdateHandler.post(uiUpdateRunnable);
     }
-
-    // 保存数据点到数据库
-    private void saveDataPointToDB(DataPoint dataPoint) {
-        DataDBHelper dbHelper = DataDBHelper.getInstance(this);
-        boolean success = dbHelper.addDataPoint(dataPoint);
-        if (!success) {
-            Log.e("DataDisplayActivity", "保存数据点失败");
-        }
-
-        // 清理旧数据（超过一周的）
-        int deleted = dbHelper.deleteOldData();
-        if (deleted > 0) {
-            Log.d("DataDisplayActivity", "已删除 " + deleted + " 条旧数据");
+    
+    // 停止定时刷新UI
+    private void stopUiUpdateTimer() {
+        if (uiUpdateHandler != null && uiUpdateRunnable != null) {
+            uiUpdateHandler.removeCallbacks(uiUpdateRunnable);
         }
     }
 
     // 更新数据显示
     private void updateDataDisplay() {
+        if (!isServiceBound || bluetoothService == null) {
+            return;
+        }
+        
+        ArrayList<DataPoint> dataPoints = bluetoothService.getDataPoints();
+        if (dataPoints.isEmpty()) {
+            return;
+        }
+        
+        // 如果是在测量中，更新按钮文本（防止状态不同步）
+        boolean isMeasuring = bluetoothService.isMeasuring();
+        if (isMeasuring) {
+            startMeasureButton.setText(R.string.stop_measure);
+        } else {
+            startMeasureButton.setText(R.string.start_measure);
+        }
+
         StringBuilder stringBuilder = new StringBuilder();
 
         // 如果数据点超过最大显示数，只显示最新的数据
@@ -368,7 +300,9 @@ public class DataDisplayActivity extends AppCompatActivity {
                     typePrefix = "ADC: ";
                     break;
                 case DataPoint.TYPE_PERCENTAGE:
-                    typePrefix = "呼吸气体氧浓度: ";
+                    typePrefix = "氧浓度: ";
+                    // 实时更新氧气浓度显示
+                    updateOxygenDisplay(point.getValue());
                     break;
                 case DataPoint.TYPE_VOLTAGE:
                     typePrefix = "电压: ";
@@ -414,16 +348,32 @@ public class DataDisplayActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        // 恢复时重新开始UI更新
+        if (isServiceBound && bluetoothService != null) {
+            startUiUpdateTimer();
+        }
+    }
+    
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // 暂停时停止UI更新
+        stopUiUpdateTimer();
+    }
+
+    @Override
     protected void onDestroy() {
         super.onDestroy();
 
+        // 停止UI更新
+        stopUiUpdateTimer();
+        
         // 解绑服务
         if (isServiceBound) {
             unbindService(serviceConnection);
             isServiceBound = false;
         }
-
-        // 注销广播接收器
-        unregisterReceiver(dataRequestReceiver);
     }
 }

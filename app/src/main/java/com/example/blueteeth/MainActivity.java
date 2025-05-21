@@ -61,6 +61,21 @@ public class MainActivity extends AppCompatActivity {
 
         // 设置点击监听
         setClickListeners();
+        
+        // 启动蓝牙前台服务
+        startBluetoothService();
+    }
+    
+    // 启动蓝牙前台服务
+    private void startBluetoothService() {
+        Intent serviceIntent = new Intent(this, BluetoothService.class);
+        
+        // 在Android 8.0以上需要使用startForegroundService
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent);
+        } else {
+            startService(serviceIntent);
+        }
     }
 
     private void initializeUI() {

@@ -1,8 +1,14 @@
 package com.example.blueteeth;
 
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.ServiceConnection;
 import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.IBinder;
 import android.view.MenuItem;
 import android.view.View;
 import android.widget.AdapterView;
@@ -11,11 +17,6 @@ import android.widget.Button;
 import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
-import android.content.Intent;
-import android.os.Handler;
-import android.content.BroadcastReceiver;
-import android.content.Context;
-import android.content.IntentFilter;
 import android.util.Log;
 
 import androidx.annotation.RequiresApi;
@@ -49,7 +50,8 @@ import java.util.List;
 import java.util.Map;
 
 public class ChartActivity extends AppCompatActivity {
-
+    
+    private static final String TAG = "ChartActivity";
     private static final int CHART_TYPE_LINE = 0;
     private static final int CHART_TYPE_BAR = 1;
     private static final int CHART_TYPE_PIE = 2;
@@ -62,34 +64,40 @@ public class ChartActivity extends AppCompatActivity {
     private Spinner chartTypeSpinner;
     private TextView analysisTextView;
 
-    private ArrayList<DataPoint> dataPoints;
+    private ArrayList<DataPoint> dataPoints = new ArrayList<>();
     private int currentChartType = CHART_TYPE_LINE;
+    
+    // 自动刷新相关
+    private Handler autoRefreshHandler = new Handler();
+    private Runnable autoRefreshRunnable;
+    private static final int AUTO_REFRESH_INTERVAL = 10000; // 10秒自动刷新一次
+    
+    // 蓝牙服务相关
+    private BluetoothService bluetoothService;
+    private boolean isServiceBound = false;
 
-    // 添加广播接收器，接收数据更新
-    private final BroadcastReceiver dataUpdateReceiver = new BroadcastReceiver() {
+    // 蓝牙服务连接
+    private final ServiceConnection serviceConnection = new ServiceConnection() {
         @Override
-        public void onReceive(Context context, Intent intent) {
-            if ("com.example.blueteeth.DATA_UPDATED".equals(intent.getAction())) {
-                Log.d("ChartActivity", "收到数据更新");
-                ArrayList<DataPoint> updatedData = intent.getParcelableArrayListExtra("data_points");
-                if (updatedData != null && !updatedData.isEmpty()) {
-                    // 更新数据
-                    dataPoints.clear();
-                    dataPoints.addAll(updatedData);
+        public void onServiceConnected(ComponentName name, IBinder service) {
+            BluetoothService.LocalBinder binder = (BluetoothService.LocalBinder) service;
+            bluetoothService = binder.getService();
+            isServiceBound = true;
+            
+            // 服务连接后，立即更新图表数据
+            loadDataFromService();
+            
+            // 启动自动刷新
+            startAutoRefresh();
+        }
 
-                    // 重绘图表
-                    updateChartData();
-
-                    // 显示更新完成提示
-                    Toast.makeText(ChartActivity.this, "数据已更新", Toast.LENGTH_SHORT).show();
-                } else {
-                    Toast.makeText(ChartActivity.this, "暂无新数据", Toast.LENGTH_SHORT).show();
-                }
-
-                // 恢复刷新按钮状态
-                refreshButton.setEnabled(true);
-                refreshButton.setText(R.string.refresh);
-            }
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            bluetoothService = null;
+            isServiceBound = false;
+            
+            // 停止自动刷新
+            stopAutoRefresh();
         }
     };
 
@@ -117,13 +125,6 @@ public class ChartActivity extends AppCompatActivity {
         // 设置图表选择器
         setupChartTypeSpinner();
 
-        // 获取数据点列表
-        if (getIntent().hasExtra("data_points")) {
-            dataPoints = getIntent().getParcelableArrayListExtra("data_points");
-        } else {
-            dataPoints = new ArrayList<>();
-        }
-
         // 设置图表
         setupLineChart();
         setupBarChart();
@@ -132,8 +133,9 @@ public class ChartActivity extends AppCompatActivity {
         // 显示默认图表
         showChart(currentChartType);
 
-        // 添加数据到图表
-        updateChartData();
+        // 绑定蓝牙服务
+        Intent serviceIntent = new Intent(this, BluetoothService.class);
+        bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE);
 
         // 按钮点击事件
         refreshButton.setOnClickListener(v -> {
@@ -142,39 +144,96 @@ public class ChartActivity extends AppCompatActivity {
             refreshButton.setText(R.string.refreshing);
 
             // 显示刷新中的提示
-            Toast.makeText(this, "正在从主界面获取最新数据...", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "正在获取最新数据...", Toast.LENGTH_SHORT).show();
 
             // 用动画效果清除图表，等待新数据
             clearChartsWithAnimation();
 
-            // 发送广播请求最新数据
-            Intent intent = new Intent("com.example.blueteeth.REQUEST_DATA");
-            sendBroadcast(intent);
-
-            // 注意：不在这里更新图表，而是在收到数据更新广播时更新
-            // 如果2秒内没收到响应，恢复按钮状态
-            new Handler().postDelayed(() -> {
-                if (!refreshButton.isEnabled()) {
+            // 从服务加载最新数据
+            if (isServiceBound && bluetoothService != null) {
+                dataPoints = bluetoothService.getDataPoints();
+                updateChartData();
+                refreshButton.setEnabled(true);
+                refreshButton.setText(R.string.refresh);
+                Toast.makeText(this, "数据已更新", Toast.LENGTH_SHORT).show();
+            } else {
+                // 如果服务未连接，恢复按钮状态并显示错误
+                new Handler().postDelayed(() -> {
                     refreshButton.setEnabled(true);
                     refreshButton.setText(R.string.refresh);
-                    Toast.makeText(ChartActivity.this, "获取数据超时，请重试", Toast.LENGTH_SHORT).show();
-                }
-            }, 2000);
+                    Toast.makeText(ChartActivity.this, "服务未连接，无法获取数据", Toast.LENGTH_SHORT).show();
+                }, 1000);
+            }
         });
 
         backButton.setOnClickListener(v -> finish());
+    }
+    
+    // 从服务加载数据
+    private void loadDataFromService() {
+        if (isServiceBound && bluetoothService != null) {
+            dataPoints = bluetoothService.getDataPoints();
+            updateChartData();
+        } else {
+            Log.w(TAG, "无法从蓝牙服务获取数据，服务未绑定");
+        }
+    }
+    
+    // 开始自动刷新
+    private void startAutoRefresh() {
+        autoRefreshRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (isServiceBound && bluetoothService != null) {
+                    // 更新数据
+                    loadDataFromService();
+                    Log.d(TAG, "自动刷新图表数据");
+                }
+                // 继续定时执行
+                autoRefreshHandler.postDelayed(this, AUTO_REFRESH_INTERVAL);
+            }
+        };
+        
+        // 开始定时任务
+        autoRefreshHandler.postDelayed(autoRefreshRunnable, AUTO_REFRESH_INTERVAL);
+    }
+    
+    // 停止自动刷新
+    private void stopAutoRefresh() {
+        if (autoRefreshHandler != null && autoRefreshRunnable != null) {
+            autoRefreshHandler.removeCallbacks(autoRefreshRunnable);
+        }
+    }
 
-        // 注册广播接收器
-        IntentFilter filter = new IntentFilter("com.example.blueteeth.DATA_UPDATED");
-        registerReceiver(dataUpdateReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // 恢复时刷新数据并启动自动刷新
+        if (isServiceBound && bluetoothService != null) {
+            loadDataFromService();
+            startAutoRefresh();
+        }
+    }
+    
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // 暂停时停止自动刷新
+        stopAutoRefresh();
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        
+        // 停止自动刷新
+        stopAutoRefresh();
 
-        // 注销广播接收器
-        unregisterReceiver(dataUpdateReceiver);
+        // 解绑服务
+        if (isServiceBound) {
+            unbindService(serviceConnection);
+            isServiceBound = false;
+        }
     }
 
     private void setupChartTypeSpinner() {
